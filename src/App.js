@@ -143,9 +143,7 @@ function VoiceMode({ sendCommand }) {
   const [isListening, setIsListening] = useState(false);
   const [transcript, setTranscript] = useState('');
   
-  const [autoStopSeconds, setAutoStopSeconds] = useState(3); 
-  
-  // NEW: UI State for the Voice Activity Detector (VAD)
+  const [autoStopSeconds, setAutoStopSeconds] = useState(1); 
   const [isDetectingSpeech, setIsDetectingSpeech] = useState(false);
 
   const audioContextRef = useRef(null);
@@ -155,20 +153,14 @@ function VoiceMode({ sendCommand }) {
   const intervalIdRef = useRef(null);
   const autoStopTimerRef = useRef(null);
 
-  // VAD logic references
   const voiceSubModeRef = useRef(voiceSubMode);
   const lastSoundTimeRef = useRef(0);
   const isSpeakingRef = useRef(false);
   const isDetectingSpeechRef = useRef(false);
 
-  const API_KEY = 'AIzaSyBuI5x6rdzXJUwgfQ-8I0569-Q0Ery9zfs';
+  const forceStopAllRef = useRef(null); 
 
-  // Keep the ref updated so the audio processor knows which mode we are in
-  useEffect(() => {
-    voiceSubModeRef.current = voiceSubMode;
-    forceStopAll();
-    return () => forceStopAll();
-  }, [voiceSubMode]); 
+  const API_KEY = 'AIzaSyBuI5x6rdzXJUwgfQ-8I0569-Q0Ery9zfs';
 
   const executeVoiceCommand = (cmd, textSpoken) => {
     sendCommand(cmd);
@@ -190,14 +182,54 @@ function VoiceMode({ sendCommand }) {
     isDetectingSpeechRef.current = false;
     setIsDetectingSpeech(false);
 
-    if (intervalIdRef.current) clearInterval(intervalIdRef.current);
-    if (processorRef.current) processorRef.current.disconnect();
+    // 🚨 CRITICAL FIX: Fully clear intervals, tracks, AND close the AudioContext
+    if (intervalIdRef.current) {
+      clearInterval(intervalIdRef.current);
+      intervalIdRef.current = null;
+    }
+    if (processorRef.current) {
+      processorRef.current.disconnect();
+      processorRef.current = null;
+    }
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach(track => track.stop());
+      mediaStreamRef.current = null;
     }
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+      // Force kill the audio thread to prevent the zombie context memory leak
+      audioContextRef.current.close().catch(e => console.error("Close error:", e));
+      audioContextRef.current = null;
+    }
+    
+    pcmDataRef.current = [];
     executeVoiceCommand('S', 'Emergency Stop');
     setTranscript('');
   };
+
+  useEffect(() => {
+    forceStopAllRef.current = forceStopAll;
+  });
+
+  useEffect(() => {
+    voiceSubModeRef.current = voiceSubMode;
+    forceStopAll();
+    return () => forceStopAll();
+  }, [voiceSubMode]); 
+
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        // App backgrounded: aggressively terminate everything.
+        if (forceStopAllRef.current) forceStopAllRef.current();
+        setTranscript('App paused by OS. Tap Start.');
+      }
+      // When visible again, we do NOT auto-resume. We let the user manually tap Start 
+      // to cleanly spin up a fresh AudioContext without lag.
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, []);
 
   const encodeWAV = (samples, sampleRate) => {
     const buffer = new ArrayBuffer(44 + samples.length * 2);
@@ -270,7 +302,6 @@ function VoiceMode({ sendCommand }) {
   const processAudioChunk = (isLiveMode) => {
     if (pcmDataRef.current.length === 0 || !audioContextRef.current) return;
     
-    // Snapshot buffer and clear instantly for next speech
     const currentChunks = [...pcmDataRef.current];
     pcmDataRef.current = [];
 
@@ -306,7 +337,13 @@ function VoiceMode({ sendCommand }) {
       }
       
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          } 
+        });
         mediaStreamRef.current = stream;
 
         const AudioContext = window.AudioContext || window.webkitAudioContext;
@@ -318,13 +355,11 @@ function VoiceMode({ sendCommand }) {
         processorRef.current = processor;
         pcmDataRef.current = [];
         
-        // Reset VAD state
         isSpeakingRef.current = false;
         lastSoundTimeRef.current = 0;
         isDetectingSpeechRef.current = false;
         setIsDetectingSpeech(false);
 
-        // 🚨 THE CUSTOM VAD PROCESSOR 🚨
         processor.onaudioprocess = (e) => {
           const channelData = e.inputBuffer.getChannelData(0);
           const float32Array = new Float32Array(channelData);
@@ -336,14 +371,11 @@ function VoiceMode({ sendCommand }) {
               if (Math.abs(float32Array[i]) > maxVol) maxVol = Math.abs(float32Array[i]);
             }
 
-            // Noise gate: 0.04 threshold ignores background static but catches voices
-            if (maxVol > 0.04) {
+            if (maxVol > 0.05) { 
               lastSoundTimeRef.current = Date.now();
               isSpeakingRef.current = true;
             }
 
-            // Pre-roll Buffer: If not speaking, delete old audio. 
-            // Keeps memory low while saving the last ~1 second so we don't cut off the first letter of your word.
             if (!isSpeakingRef.current && pcmDataRef.current.length > 10) {
               pcmDataRef.current.shift();
             }
@@ -357,21 +389,17 @@ function VoiceMode({ sendCommand }) {
         setTranscript('Listening...');
 
         if (voiceSubMode === 'LIVE') {
-          // Monitor the VAD state every 150ms
           intervalIdRef.current = setInterval(() => {
             const currentlySpeaking = isSpeakingRef.current;
 
-            // Trigger UI animation if speech starts/stops
             if (currentlySpeaking !== isDetectingSpeechRef.current) {
               isDetectingSpeechRef.current = currentlySpeaking;
               setIsDetectingSpeech(currentlySpeaking);
             }
 
-            // The Silence Timeout
             if (currentlySpeaking) {
               const timeSinceLastSound = Date.now() - lastSoundTimeRef.current;
               
-              // If 1.2 seconds pass with no sound, trigger the upload!
               if (timeSinceLastSound > 1200) {
                 isSpeakingRef.current = false;
                 isDetectingSpeechRef.current = false;
@@ -392,9 +420,6 @@ function VoiceMode({ sendCommand }) {
   return (
     <div style={styles.modeWrapper}>
       
-      {/* ------------------------------------------- */}
-      {/* THE "FAKE" GOOGLE NATIVE POPUP OVERLAY */}
-      {/* ------------------------------------------- */}
       {isListening && (
         <div style={{
           position: 'fixed',
@@ -422,7 +447,6 @@ function VoiceMode({ sendCommand }) {
               backgroundColor: '#4285F4',
               borderRadius: '50%',
               display: 'flex', alignItems: 'center', justifyContent: 'center',
-              // Dynamic pulsing animation based on the VAD state!
               boxShadow: isDetectingSpeech ? '0 0 0 15px rgba(66, 133, 244, 0.2)' : '0 4px 15px rgba(66, 133, 244, 0.4)',
               transform: isDetectingSpeech ? 'scale(1.1)' : 'scale(1)',
               transition: 'all 0.15s ease-in-out',
@@ -452,9 +476,7 @@ function VoiceMode({ sendCommand }) {
           </div>
         </div>
       )}
-      {/* ------------------------------------------- */}
 
-      {/* SETTINGS BATCH */}
       <div style={{ width: '100%', padding: '15px', marginBottom: '15px', background: '#222', borderRadius: '12px', boxSizing: 'border-box' }}>
         <label style={{ display: 'flex', justifyContent: 'space-between', color: '#ff9500', marginBottom: '10px', fontSize: '13px', fontWeight: 'bold' }}>
           <span>🛡️ Auto-Brake Safety</span>
