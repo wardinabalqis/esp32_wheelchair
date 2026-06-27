@@ -1,6 +1,6 @@
 {
-  "homepage": "https:///athirahnabilah.github.io/pico/",
-  "name": "pico",
+  "homepage": "https:///wardinabalqis.github.io/esp32_wheelchair/",
+  "name": "esp32-wheelchair",
   "version": "0.1.0",
   "private": true,
   "dependencies": {
