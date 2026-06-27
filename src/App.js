@@ -95,7 +95,7 @@ export default function WheelchairDashboard() {
 }
 
 // ==========================================
-// MODE 1: GAMEPAD (Swapped Left/Right)
+// MODE 1: GAMEPAD
 // ==========================================
 function GamepadMode({ sendCommand, activeSpeed, onSpeedChange }) {
   const gamepadAction = (directionChar) => ({
@@ -123,7 +123,6 @@ function GamepadMode({ sendCommand, activeSpeed, onSpeedChange }) {
           <button style={styles.navBtn} {...gamepadAction('U')}>▲ FWD</button>
         </div>
         <div style={styles.dRow}>
-          {/* SWAPPED COMMANDS: Visual Left sends 'R', Visual Right sends 'L' */}
           <button style={styles.navBtn} {...gamepadAction('R')}>◀ LFT</button>
           <div style={styles.centerSpace}></div>
           <button style={styles.navBtn} {...gamepadAction('L')}>RGT ▶</button>
@@ -137,90 +136,346 @@ function GamepadMode({ sendCommand, activeSpeed, onSpeedChange }) {
 }
 
 // ==========================================
-// MODE 2: NATIVE BROWSER VOICE CONTROL (No API Key)
+// MODE 2: VOICE (WITH CUSTOM AUTOMATIC VAD ENGINE)
 // ==========================================
 function VoiceMode({ sendCommand }) {
+  const [voiceSubMode, setVoiceSubMode] = useState('LIVE'); 
   const [isListening, setIsListening] = useState(false);
   const [transcript, setTranscript] = useState('');
-  const recognitionRef = useRef(null);
+  
+  const [autoStopSeconds, setAutoStopSeconds] = useState(3); 
+  
+  // NEW: UI State for the Voice Activity Detector (VAD)
+  const [isDetectingSpeech, setIsDetectingSpeech] = useState(false);
 
+  const audioContextRef = useRef(null);
+  const processorRef = useRef(null);
+  const mediaStreamRef = useRef(null);
+  const pcmDataRef = useRef([]);
+  const intervalIdRef = useRef(null);
+  const autoStopTimerRef = useRef(null);
+
+  // VAD logic references
+  const voiceSubModeRef = useRef(voiceSubMode);
+  const lastSoundTimeRef = useRef(0);
+  const isSpeakingRef = useRef(false);
+  const isDetectingSpeechRef = useRef(false);
+
+  const API_KEY = 'AIzaSyBuI5x6rdzXJUwgfQ-8I0569-Q0Ery9zfs';
+
+  // Keep the ref updated so the audio processor knows which mode we are in
   useEffect(() => {
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    
-    if (SpeechRecognition) {
-      recognitionRef.current = new SpeechRecognition();
-      recognitionRef.current.continuous = true;
-      recognitionRef.current.interimResults = true;
-      recognitionRef.current.lang = 'en-US';
+    voiceSubModeRef.current = voiceSubMode;
+    forceStopAll();
+    return () => forceStopAll();
+  }, [voiceSubMode]); 
 
-      recognitionRef.current.onresult = (event) => {
-        let currentTranscript = '';
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          currentTranscript += event.results[i][0].transcript;
+  const executeVoiceCommand = (cmd, textSpoken) => {
+    sendCommand(cmd);
+    if (autoStopTimerRef.current) {
+      clearTimeout(autoStopTimerRef.current);
+      autoStopTimerRef.current = null;
+    }
+    if (cmd !== 'S') {
+      autoStopTimerRef.current = setTimeout(() => {
+        sendCommand('S'); 
+        setTranscript(`"${textSpoken}" 🛑 Auto-Braked`);
+      }, autoStopSeconds * 1000); 
+    }
+  };
+
+  const forceStopAll = () => {
+    setIsListening(false);
+    isSpeakingRef.current = false;
+    isDetectingSpeechRef.current = false;
+    setIsDetectingSpeech(false);
+
+    if (intervalIdRef.current) clearInterval(intervalIdRef.current);
+    if (processorRef.current) processorRef.current.disconnect();
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach(track => track.stop());
+    }
+    executeVoiceCommand('S', 'Emergency Stop');
+    setTranscript('');
+  };
+
+  const encodeWAV = (samples, sampleRate) => {
+    const buffer = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(buffer);
+    const writeString = (view, offset, string) => {
+      for (let i = 0; i < string.length; i++) view.setUint8(offset + i, string.charCodeAt(i));
+    };
+    writeString(view, 0, 'RIFF');
+    view.setUint32(4, 36 + samples.length * 2, true);
+    writeString(view, 8, 'WAVE');
+    writeString(view, 12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true); 
+    view.setUint16(22, 1, true); 
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true); 
+    writeString(view, 36, 'data');
+    view.setUint32(40, samples.length * 2, true);
+    let offset = 44;
+    for (let i = 0; i < samples.length; i++, offset += 2) {
+      let s = Math.max(-1, Math.min(1, samples[i]));
+      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    }
+    return buffer;
+  };
+
+  const uploadToGoogle = async (base64data, sampleRate, isLive) => {
+    if (!isLive) setTranscript('Processing...');
+    
+    try {
+      const response = await fetch(`https://speech.googleapis.com/v1/speech:recognize?key=${API_KEY}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          config: {
+            encoding: 'LINEAR16', 
+            sampleRateHertz: sampleRate,
+            languageCode: 'en-US',
+            model: 'command_and_search',
+            speechContexts: [{
+              phrases: ["forward", "up", "depan", "straight", "reverse", "back", "backward", "down", "lewis", "gostan", "left", "kiri", "right", "kanan", "stop", "brake", "berhenti"],
+              boost: 20
+            }]
+          },
+          audio: { content: base64data }
+        })
+      });
+
+      const data = await response.json();
+      if (data.results && data.results.length > 0) {
+        const text = data.results[0].alternatives[0].transcript.toLowerCase().trim();
+        setTranscript(`"${text}"`);
+
+        if (text.includes('forward') || text.includes('up') || text.includes('depan') || text.includes('straight')) executeVoiceCommand('U', text);
+        else if (text.includes('back') || text.includes('reverse') || text.includes('down') || text.includes('lewis') || text.includes('gostan')) executeVoiceCommand('D', text);
+        else if (text.includes('left') || text.includes('kiri')) executeVoiceCommand('L', text);
+        else if (text.includes('right') || text.includes('kanan')) executeVoiceCommand('R', text);
+        else if (text.includes('stop') || text.includes('brake') || text.includes('berhenti')) executeVoiceCommand('S', text);
+      } else {
+        if (!isLive) setTranscript('Try again.');
+      }
+    } catch (error) {
+      console.error("Google API Error:", error);
+      if (!isLive) setTranscript('Connection Error.');
+    }
+  };
+
+  const processAudioChunk = (isLiveMode) => {
+    if (pcmDataRef.current.length === 0 || !audioContextRef.current) return;
+    
+    // Snapshot buffer and clear instantly for next speech
+    const currentChunks = [...pcmDataRef.current];
+    pcmDataRef.current = [];
+
+    const length = currentChunks.reduce((sum, arr) => sum + arr.length, 0);
+    const float32Array = new Float32Array(length);
+    let offset = 0;
+
+    for (let arr of currentChunks) {
+      float32Array.set(arr, offset);
+      offset += arr.length;
+    }
+
+    const sampleRate = audioContextRef.current.sampleRate;
+    const wavBuffer = encodeWAV(float32Array, sampleRate);
+    const wavBlob = new Blob([wavBuffer], { type: 'audio/wav' });
+    
+    const reader = new FileReader();
+    reader.readAsDataURL(wavBlob);
+    reader.onloadend = () => {
+      const base64data = reader.result.split(',')[1];
+      uploadToGoogle(base64data, sampleRate, isLiveMode);
+    };
+  };
+
+  const toggleListen = async () => {
+    if (isListening) {
+      if (voiceSubMode === 'PTT') processAudioChunk(false); 
+      forceStopAll();
+    } else {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        setTranscript('Mic Error');
+        return; 
+      }
+      
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mediaStreamRef.current = stream;
+
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        const audioCtx = new AudioContext();
+        audioContextRef.current = audioCtx;
+        
+        const source = audioCtx.createMediaStreamSource(stream);
+        const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+        processorRef.current = processor;
+        pcmDataRef.current = [];
+        
+        // Reset VAD state
+        isSpeakingRef.current = false;
+        lastSoundTimeRef.current = 0;
+        isDetectingSpeechRef.current = false;
+        setIsDetectingSpeech(false);
+
+        // 🚨 THE CUSTOM VAD PROCESSOR 🚨
+        processor.onaudioprocess = (e) => {
+          const channelData = e.inputBuffer.getChannelData(0);
+          const float32Array = new Float32Array(channelData);
+          pcmDataRef.current.push(float32Array);
+
+          if (voiceSubModeRef.current === 'LIVE') {
+            let maxVol = 0;
+            for (let i = 0; i < float32Array.length; i++) {
+              if (Math.abs(float32Array[i]) > maxVol) maxVol = Math.abs(float32Array[i]);
+            }
+
+            // Noise gate: 0.04 threshold ignores background static but catches voices
+            if (maxVol > 0.04) {
+              lastSoundTimeRef.current = Date.now();
+              isSpeakingRef.current = true;
+            }
+
+            // Pre-roll Buffer: If not speaking, delete old audio. 
+            // Keeps memory low while saving the last ~1 second so we don't cut off the first letter of your word.
+            if (!isSpeakingRef.current && pcmDataRef.current.length > 10) {
+              pcmDataRef.current.shift();
+            }
+          }
+        };
+
+        source.connect(processor);
+        processor.connect(audioCtx.destination); 
+
+        setIsListening(true);
+        setTranscript('Listening...');
+
+        if (voiceSubMode === 'LIVE') {
+          // Monitor the VAD state every 150ms
+          intervalIdRef.current = setInterval(() => {
+            const currentlySpeaking = isSpeakingRef.current;
+
+            // Trigger UI animation if speech starts/stops
+            if (currentlySpeaking !== isDetectingSpeechRef.current) {
+              isDetectingSpeechRef.current = currentlySpeaking;
+              setIsDetectingSpeech(currentlySpeaking);
+            }
+
+            // The Silence Timeout
+            if (currentlySpeaking) {
+              const timeSinceLastSound = Date.now() - lastSoundTimeRef.current;
+              
+              // If 1.2 seconds pass with no sound, trigger the upload!
+              if (timeSinceLastSound > 1200) {
+                isSpeakingRef.current = false;
+                isDetectingSpeechRef.current = false;
+                setIsDetectingSpeech(false);
+                processAudioChunk(true);
+              }
+            }
+          }, 150);
         }
         
-        const lowerText = currentTranscript.toLowerCase();
-        setTranscript(`Heard: "${lowerText}"`);
-
-        if (lowerText.includes('forward')) { sendCommand('U'); }
-        else if (lowerText.includes('back') || lowerText.includes('reverse')) { sendCommand('D'); }
-        else if (lowerText.includes('left')) { sendCommand('L'); }
-        else if (lowerText.includes('right')) { sendCommand('R'); }
-        else if (lowerText.includes('stop')) { sendCommand('S'); }
-      };
-
-      recognitionRef.current.onerror = (event) => {
-        console.error("Speech error: ", event.error);
-        setIsListening(false);
-        if (event.error === 'not-allowed') {
-          setTranscript('❌ Microphone permission denied.');
-        } else {
-          setTranscript(`Error: ${event.error}`);
-        }
-      };
-    }
-  }, [sendCommand]);
-
-  const toggleListen = () => {
-    if (!recognitionRef.current) {
-      setTranscript('❌ Error: This browser does not support native speech recognition.');
-      return;
-    }
-
-    if (isListening) {
-      recognitionRef.current.stop();
-      setIsListening(false);
-      sendCommand('S');
-    } else {
-      setTranscript('Listening for commands...');
-      try {
-        recognitionRef.current.start();
-        setIsListening(true);
       } catch (err) {
         console.error("Mic start error:", err);
+        setTranscript('Mic Denied');
       }
     }
   };
 
   return (
     <div style={styles.modeWrapper}>
-      <h3 style={styles.sectionTitle}>Say: "Forward", "Left", "Right", "Stop"</h3>
-      <p style={{ color: '#ff9500', fontSize: '13px', textAlign: 'center', marginBottom: '15px', padding: '0 10px' }}>
-        Using native local microphone (No API keys required)
-      </p>
       
-      <button 
-        style={{ ...styles.micBtn, backgroundColor: isListening ? '#ff453a' : '#30d158' }} 
-        onClick={toggleListen}
-      >
-        {isListening ? '🛑 Stop Listening' : '🎙️ Start Microphone'}
-      </button>
-      
-      <div style={styles.transcriptBox}>
-        {transcript || "Press start and speak..."}
+      {/* ------------------------------------------- */}
+      {/* THE "FAKE" GOOGLE NATIVE POPUP OVERLAY */}
+      {/* ------------------------------------------- */}
+      {isListening && (
+        <div style={{
+          position: 'fixed',
+          top: 0, left: 0, width: '100vw', height: '100vh',
+          backgroundColor: 'rgba(0, 0, 0, 0.85)',
+          display: 'flex', flexDirection: 'column',
+          alignItems: 'center', justifyContent: 'center',
+          zIndex: 9999, 
+          backdropFilter: 'blur(5px)'
+        }}>
+          <div style={{
+            background: '#fff',
+            borderRadius: '24px',
+            padding: '40px 20px',
+            width: '80%',
+            maxWidth: '350px',
+            display: 'flex', flexDirection: 'column',
+            alignItems: 'center',
+            boxShadow: '0 20px 40px rgba(0,0,0,0.5)'
+          }}>
+            <h2 style={{ margin: '0 0 30px 0', color: '#555', fontSize: '22px', fontWeight: '400' }}>Google</h2>
+            
+            <div style={{
+              width: '90px', height: '90px',
+              backgroundColor: '#4285F4',
+              borderRadius: '50%',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              // Dynamic pulsing animation based on the VAD state!
+              boxShadow: isDetectingSpeech ? '0 0 0 15px rgba(66, 133, 244, 0.2)' : '0 4px 15px rgba(66, 133, 244, 0.4)',
+              transform: isDetectingSpeech ? 'scale(1.1)' : 'scale(1)',
+              transition: 'all 0.15s ease-in-out',
+              marginBottom: '20px'
+            }}>
+              <span style={{ fontSize: '40px' }}>🎙️</span>
+            </div>
+            
+            <p style={{ color: '#888', fontSize: '18px', margin: '10px 0 30px 0', minHeight: '24px', textAlign: 'center', fontWeight: isDetectingSpeech ? 'bold' : 'normal' }}>
+              {isDetectingSpeech ? "Detecting Voice..." : transcript}
+            </p>
+            
+            <button 
+              onClick={toggleListen}
+              style={{
+                padding: '12px 30px',
+                fontSize: '16px',
+                color: '#4285F4',
+                background: 'transparent',
+                border: 'none',
+                fontWeight: 'bold',
+                cursor: 'pointer'
+              }}
+            >
+              STOP
+            </button>
+          </div>
+        </div>
+      )}
+      {/* ------------------------------------------- */}
+
+      {/* SETTINGS BATCH */}
+      <div style={{ width: '100%', padding: '15px', marginBottom: '15px', background: '#222', borderRadius: '12px', boxSizing: 'border-box' }}>
+        <label style={{ display: 'flex', justifyContent: 'space-between', color: '#ff9500', marginBottom: '10px', fontSize: '13px', fontWeight: 'bold' }}>
+          <span>🛡️ Auto-Brake Safety</span>
+          <span>{autoStopSeconds} sec</span>
+        </label>
+        <input 
+          type="range" min="1" max="10" step="1"
+          value={autoStopSeconds} 
+          onChange={(e) => setAutoStopSeconds(Number(e.target.value))}
+          style={{ width: '100%', accentColor: '#ff9500', marginBottom: '10px' }}
+        />
       </div>
 
-      <button style={styles.emergencyBtn} onClick={() => sendCommand('S')}>
+      <button 
+        style={{ ...styles.micBtn, backgroundColor: '#30d158' }} 
+        onClick={toggleListen}
+      >
+        {voiceSubMode === 'PTT' ? '🎙️ Tap to Record' : '🎙️ Start Auto-VAD Engine'}
+      </button>
+
+      <button style={styles.emergencyBtn} onClick={forceStopAll}>
         EMERGENCY STOP
       </button>
     </div>
@@ -228,7 +483,7 @@ function VoiceMode({ sendCommand }) {
 }
 
 // ==========================================
-// MODE 3: JOYSTICK MOTION CONTROL (100 Max + Steering Bias)
+// MODE 3: JOYSTICK MOTION CONTROL
 // ==========================================
 function JoystickMotionMode({ sendCommand }) {
   const [isTracking, setIsTracking] = useState(false);
@@ -267,7 +522,6 @@ function JoystickMotionMode({ sendCommand }) {
     const handleOrientation = (event) => {
       let { beta, gamma } = event; 
       
-      // 1. VISUAL JOYSTICK MATH
       const MAX_TILT = 100; 
       const MAX_TRAVEL = 90; 
 
@@ -282,20 +536,16 @@ function JoystickMotionMode({ sendCommand }) {
 
       setPuckPos({ x: normX * MAX_TRAVEL, y: normY * MAX_TRAVEL });
 
-      // 2. BLUETOOTH COMMAND MATH (With Steering Bias)
       let newCommand = 'S';
       
       if (Math.abs(beta) > sensitivity || Math.abs(gamma) > sensitivity) {
-        // STEERING BIAS: Multiplies gamma by 1.5 to prioritize left/right turns
         if (Math.abs(beta) > (Math.abs(gamma) * 1.5)) {
           newCommand = beta < -sensitivity ? 'U' : 'D'; 
         } else {
-          // STANDARD COMMANDS
           newCommand = gamma < -sensitivity ? 'L' : 'R';
         }
       }
 
-      // 3. THROTTLE TRANSMISSION
       if (newCommand !== lastSentRef.current) {
         lastSentRef.current = newCommand;
         setActiveCommand(newCommand);
@@ -320,7 +570,6 @@ function JoystickMotionMode({ sendCommand }) {
     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', width: '100%' }}>
       <h3 style={{ margin: '0 0 15px 0', fontSize: '18px', fontWeight: '600', color: '#eaeaea' }}>Tilt Phone to Steer</h3>
       
-      {/* Visual Joystick Canvas */}
       <div style={{ position: 'relative', width: '240px', height: '240px', background: '#0a0a0c', borderRadius: '50%', border: '4px solid #333', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '20px auto', boxShadow: 'inset 0 0 30px rgba(0,0,0,0.8)' }}>
         <div style={{
           position: 'absolute', borderRadius: '50%', border: '2px dashed #555', backgroundColor: 'rgba(255, 255, 255, 0.02)', transition: 'all 0.2s ease',
@@ -385,15 +634,11 @@ const styles = {
   sectionTitle: { margin: '0 0 15px 0', fontSize: '18px', fontWeight: '600', color: '#eaeaea' },
   row: { display: 'flex', justifyContent: 'space-around', width: '100%', gap: '10px', marginBottom: '10px' },
   speedBtn: { flex: 1, padding: '15px 5px', fontSize: '16px', background: '#ff9500', color: '#fff', border: 'none', borderRadius: '8px', fontWeight: 'bold', cursor: 'pointer' },
-  
-  // D-PAD STYLES
   dPad: { display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '12px' },
   dRow: { display: 'flex', gap: '12px', justifyContent: 'center', width: '100%' },
   navBtn: { width: '110px', height: '75px', fontSize: '15px', fontWeight: 'bold', background: '#0a84ff', color: '#fff', border: 'none', borderRadius: '14px', touchAction: 'none', WebkitTapHighlightColor: 'transparent', WebkitTouchCallout: 'none', WebkitUserSelect: 'none', userSelect: 'none', cursor: 'pointer' },
   centerSpace: { width: '110px', height: '75px' },
-  
-  // VOICE STYLES
-  micBtn: { padding: '20px', fontSize: '18px', color: '#fff', border: 'none', borderRadius: '12px', width: '100%', fontWeight: 'bold', margin: '10px 0', cursor: 'pointer' },
+  micBtn: { padding: '20px', fontSize: '18px', color: '#fff', border: 'none', borderRadius: '12px', width: '100%', fontWeight: 'bold', margin: '10px 0', cursor: 'pointer', transition: 'background-color 0.2s' },
   transcriptBox: { width: '100%', minHeight: '90px', background: '#000', padding: '15px', borderRadius: '10px', border: '1px solid #333', fontSize: '18px', textAlign: 'center', boxSizing: 'border-box', display: 'flex', alignItems: 'center', justifyContent: 'center' },
   emergencyBtn: { width: '100%', padding: '25px', marginTop: '20px', background: '#ff453a', color: '#fff', fontSize: '20px', fontWeight: 'bold', border: 'none', borderRadius: '12px', cursor: 'pointer' }
 };
