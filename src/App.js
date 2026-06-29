@@ -1,19 +1,76 @@
 import React, { useState, useRef, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getDatabase, ref, update } from 'firebase/database';
 
+// ==========================================
+// FIREBASE CONFIGURATION
+// ==========================================
+const firebaseConfig = {
+  apiKey: "AIzaSyCJ76eUpV5wvVlrZLKbd3S1k2gM6PsngB4",
+  authDomain: "wheelchair-15ba8.firebaseapp.com",
+  databaseURL: "https://wheelchair-15ba8-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "wheelchair-15ba8",
+  storageBucket: "wheelchair-15ba8.firebasestorage.app",
+  messagingSenderId: "524149398157",
+  appId: "1:524149398157:web:a80a23e12980181c1320c4"
+};
+
+const app = initializeApp(firebaseConfig);
+const database = getDatabase(app);
+
+// ==========================================
+// MAIN DASHBOARD COMPONENT
+// ==========================================
 export default function WheelchairDashboard() {
   const [status, setStatus] = useState('Disconnected');
   const [isConnected, setIsConnected] = useState(false);
   const [activeMode, setActiveMode] = useState(1); 
   const [activeSpeed, setActiveSpeed] = useState('2'); 
+  const [phoneLocation, setPhoneLocation] = useState({ lat: 0, lng: 0 });
   
   const rxCharacteristicRef = useRef(null);
 
   const SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
   const CHARACTERISTIC_UUID_RX = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
 
-  // ==========================================
+  // LOCATION TRACKING & FIREBASE SYNC
+  useEffect(() => {
+    let watchId;
+
+    if ('geolocation' in navigator) {
+      watchId = navigator.geolocation.watchPosition(
+        (position) => {
+          const lat = position.coords.latitude;
+          const lng = position.coords.longitude;
+          
+          setPhoneLocation({ lat, lng });
+
+          const locationRef = ref(database, '/');
+          update(locationRef, {
+            phone_latitude: lat,
+            phone_longitude: lng,
+            timestamp: Date.now()
+          }).catch(error => console.error("Firebase update failed:", error));
+        },
+        (error) => {
+          console.error("Error getting location:", error);
+        },
+        {
+          enableHighAccuracy: true,
+          maximumAge: 0,
+          timeout: 5000
+        }
+      );
+    } else {
+      console.warn("Geolocation is not supported by this browser.");
+    }
+
+    return () => {
+      if (watchId) navigator.geolocation.clearWatch(watchId);
+    };
+  }, []);
+
   // BLUETOOTH CORE
-  // ==========================================
   const connectToWheelchair = async () => {
     if (!navigator.bluetooth) {
       setStatus('Web Bluetooth is not supported by this browser.');
@@ -68,6 +125,9 @@ export default function WheelchairDashboard() {
         <h2 style={styles.title}>Wheelchair OS</h2>
         <div style={{ ...styles.statusBar, backgroundColor: isConnected ? '#2ecc71' : '#e74c3c' }}>
           {status}
+        </div>
+        <div style={{ fontSize: '12px', color: '#888', marginTop: '10px' }}>
+          GPS: {phoneLocation.lat.toFixed(5)}, {phoneLocation.lng.toFixed(5)}
         </div>
       </header>
 
@@ -182,7 +242,6 @@ function VoiceMode({ sendCommand }) {
     isDetectingSpeechRef.current = false;
     setIsDetectingSpeech(false);
 
-    // 🚨 CRITICAL FIX: Fully clear intervals, tracks, AND close the AudioContext
     if (intervalIdRef.current) {
       clearInterval(intervalIdRef.current);
       intervalIdRef.current = null;
@@ -196,7 +255,6 @@ function VoiceMode({ sendCommand }) {
       mediaStreamRef.current = null;
     }
     if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-      // Force kill the audio thread to prevent the zombie context memory leak
       audioContextRef.current.close().catch(e => console.error("Close error:", e));
       audioContextRef.current = null;
     }
@@ -219,12 +277,9 @@ function VoiceMode({ sendCommand }) {
   useEffect(() => {
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'hidden') {
-        // App backgrounded: aggressively terminate everything.
         if (forceStopAllRef.current) forceStopAllRef.current();
         setTranscript('App paused by OS. Tap Start.');
       }
-      // When visible again, we do NOT auto-resume. We let the user manually tap Start 
-      // to cleanly spin up a fresh AudioContext without lag.
     };
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
@@ -419,7 +474,6 @@ function VoiceMode({ sendCommand }) {
 
   return (
     <div style={styles.modeWrapper}>
-      
       {isListening && (
         <div style={{
           position: 'fixed',
