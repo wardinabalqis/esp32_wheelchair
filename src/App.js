@@ -49,7 +49,7 @@ export default function WheelchairDashboard() {
           update(locationRef, {
             phone_latitude: lat,
             phone_longitude: lng,
-            timestamp: Date.now()
+            // timestamp: Date.now()
           }).catch(error => console.error("Firebase update failed:", error));
         },
         (error) => {
